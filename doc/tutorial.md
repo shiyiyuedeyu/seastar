@@ -1,3 +1,4 @@
+% translation by shiyiyuedeyu
 % Asynchronous Programming with Seastar
 % Nadav Har'El - nyh@ScyllaDB.com
   Avi Kivity - avi@ScyllaDB.com
