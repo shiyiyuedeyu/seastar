@@ -1,57 +1,79 @@
-% translation by shiyiyuedeyu
+% translation by shiyiyuedeyu  
 % Asynchronous Programming with Seastar
 % Nadav Har'El - nyh@ScyllaDB.com
   Avi Kivity - avi@ScyllaDB.com
 
 # Introduction
 **Seastar**, which we introduce in this document, is a C++ library for writing highly efficient complex server applications on modern multi-core machines.
+seastar是个C++高性能库，专为多核设计。  
 
 Traditionally, the programming languages libraries and frameworks used for writing server applications have been divided into two distinct camps: those focusing on efficiency, and those focusing on complexity. Some frameworks are extremely efficient and yet allow building only simple applications (e.g., DPDK allows applications which process packets individually), while other frameworks allow building extremely complex applications, at the cost of run-time efficiency. Seastar is our attempt to get the best of both worlds: To create a library which allows building highly complex server applications, and yet achieve optimal performance.
 
 The inspiration and first use case of Seastar was Scylla, a rewrite of Apache Cassandra. Cassandra is a very complex application, and yet, with Seastar we were able to re-implement it with as much as 10-fold throughput increase, as well as significantly lower and more consistent latencies.
 
 Seastar offers a complete asynchronous programming framework, which uses two concepts - **futures** and **continuations** - to uniformly represent, and handle, every type of asynchronous event, including network I/O, disk I/O, and complex combinations of other events.
+seastar提供异步编程框架，利用futures和continuations这两个概念，去处理各种异步事件——包括网络IO和磁盘IO等等。  
 
 Since modern multi-core and multi-socket machines have steep penalties for sharing data between cores (atomic instructions, cache line bouncing and memory fences), Seastar programs use the share-nothing programming model, i.e., the available memory is divided between the cores, each core works on data in its own part of memory, and communication between cores happens via explicit message passing (which itself happens using the SMP's shared memory hardware, of course).
+seastar编程使用share-nothing编程模式，每个核在自己分配的内存上工作，核之间的通信通过显式的消息传递  
 
-## Asynchronous programming
+## Asynchronous programming异步编程
 A server for a network protocol, such as the classic HTTP (Web) or SMTP (e-mail) servers, inherently deals with parallelism: Multiple clients send requests in parallel, and we cannot finish handling one request before starting to handle the next: A request may, and often does, need to block because of various reasons --- a full TCP window (i.e., a slow connection), disk I/O, or even the client holding on to an inactive connection --- and the server needs to handle other connections as well.
+处理并发请求存在不少麻烦  
 
 The most straightforward way to handle such parallel connections, employed by classic network servers such as Inetd, Apache Httpd and Sendmail, is to use a separate operating-system process per connection. This technique evolved over the years to improve its performance: At first, a new process was spawned to handle each new connection; Later, a pool of existing processes was kept and each new connection was assigned to an unemployed process from the pool; Finally, the processes were replaced by threads. However, the common idea behind all these implementations is that at each moment, each process handles exclusively a single connection. Therefore, the server code is free to use blocking system calls, such as reading or writing to a connection, or reading from disk, and if this process blocks, all is well because we have many additional processes ready to handle other connections.
+最直接的方法去处理这些并发连接就是为每个连接调起一个进程，后面优化成进程池，再后来优化成线程。总体来说就是同一时刻一个进程处理一个连接，故而（在一个进程/线程中）使用阻塞式系统调用问题不大，其他进程仍然继续工作。  
 
 Programming a server which uses a process (or a thread) per connection is known as *synchronous* programming, because the code is written linearly, and one line of code starts to run after the previous line finished. For example, the code may read a request from a socket, parse the request, and then piecemeal read a file from disk and write it back to the socket. Such code is easy to write, almost like traditional non-parallel programs. In fact, it's even possible to run an external non-parallel program to handle each request --- this is for example how Apache HTTPd ran "CGI" programs, the first implementation of dynamic Web-page generation.
+这种“同步”编程一般情况是OK的
 
 >NOTE: although the synchronous server application is written in a linear, non-parallel, fashion, behind the scenes the kernel helps ensure that everything happens in parallel and the machine's resources --- CPUs, disk and network --- are fully utilized. Beyond the process parallelism (we have multiple processes handling multiple connections in parallel), the kernel may even parallelize the work of one individual connection --- for example process an outstanding disk request (e.g., read from a disk file) in parallel with handling the network connection (send buffered-but-yet-unsent data, and buffer newly-received data until the application is ready to read it).
+基于上述编程范式，内核做了不少工作  
 
 But synchronous, process-per-connection, server programming didn't come without disadvantages and costs. Slowly but surely, server authors realized that starting a new process is slow, context switching is slow, and each process comes with significant overheads --- most notably the size of its stack. Server and kernel authors worked hard to mitigate these overheads: They switched from processes to threads, from creating new threads to thread pools, they lowered default stack size of each thread, and increased the virtual memory size to allow more partially-utilized stacks. But still, servers with synchronous designs had unsatisfactory performance, and scaled badly as the number of concurrent connections grew. In 1999, Dan Kigel popularized "the C10K problem", the need of a single server to efficiently handle 10,000 concurrent connections --- most of them slow or even inactive.
+**重点：启动一个新进程是缓慢的，上下文切换是缓慢的，每个进程都有大量的开销——最明显的是栈大小。服务器和内核作者努力减少这种开销——从进程切换到线程，从创建新线程到线程池，他们降低每个线程默认堆栈大小，并增加虚拟内存大小以允许更多的部分使用堆栈。当然大量并发连接中，大多数是不活动的或者进展**
 
 The solution, which became popular in the following decade, was to abandon the cozy but inefficient synchronous server design, and switch to a new type of server design --- the *asynchronous*, or *event-driven*, server. An event-driven server has just one thread, or more accurately, one thread per CPU. This single thread runs a tight loop which, at each iteration, checks, using ```poll()``` (or the more efficient ```epoll```) for new events on many open file descriptors, e.g., sockets. For example, an event can be a socket becoming readable (new data has arrived from the remote end) or becoming writable (we can send more data on this connection). The application handles this event by doing some non-blocking operations, modifying one or more of the file descriptors, and maintaining its knowledge of the _state_ of this connection.
+后来咱更聪明了，改成用poll和epoll了，（给咱的阻塞换个地）  
 
 However, writers of asynchronous server applications faced, and still face today, two significant challenges:
+异步服务应用两个问题：  
 
 * **Complexity:** Writing a simple asynchronous server is straightforward. But writing a *complex* asynchronous server is notoriously difficult. The handling of a single connection, instead of being a simple easy-to-read function call, now involves a large number of small callback functions, and a complex state machine to remember which function needs to be called when each event occurs.
+复杂性，异步服务器够呛
 
 * **Non-blocking:** Having just one thread per core is important for the performance of the server application, because context switches are slow. However, if we only have one thread per core, the event-handling functions must _never_ block, or the core will remain idle. But some existing programming languages and frameworks leave the server author no choice but to use blocking functions, and therefore multiple threads.
 For example, ```Cassandra``` was written as an asynchronous server application; But because disk I/O was implemented with ```mmap```ed files, which can uncontrollably block the whole thread when accessed, they are forced to run multiple threads per CPU.
+非阻塞  
 
 Moreover, when the best possible performance is desired, the server application, and its programming framework, has no choice but to also take the following into account:
+当需要最佳性能时，需要考虑以下几个因素：  
 
 * **Modern Machines**: Modern machines are very different from those of just 10 years ago. They have many cores and deep memory hierarchies (from L1 caches to NUMA) which reward certain programming practices and penalizes others: Unscalable programming practices (such as taking locks) can devastate performance on many cores; Shared memory and lock-free synchronization primitives are available (i.e., atomic operations and memory-ordering fences) but are dramatically slower than operations that involve only data in a single core's cache, and also prevent the application from scaling to many cores.
+现代机器（主要是多核问题）  
 
 * **Programming Language:** High-level languages such Java, Javascript, and similar "modern" languages are convenient, but each comes with its own set of assumptions which conflict with the requirements listed above. These languages, aiming to be portable, also give the programmer less control over the performance of critical code. For really optimal performance, we need a programming language which gives the programmer full control, zero run-time overheads, and on the other hand --- sophisticated compile-time code generation and optimization.
+编程语言——为了获得真正最佳性能，需要程序能完全控制，没有运行时开销  
 
 Seastar is a framework for writing asynchronous server applications which aims to solve all four of the above challenges: It is a framework for writing *complex* asynchronous applications involving both network and disk I/O.  The framework's fast path is entirely single-threaded (per core), scalable to many cores and minimizes the use of costly sharing of memory between cores. It is a C++14 library, giving the user sophisticated compile-time features and full control over performance, without run-time overhead.
+seastar是个C++14库，最大限度地减少内核之间共享内存的开销  
 
 ## Seastar
 
 
 Seastar is an event-driven framework allowing you to write non-blocking, asynchronous code in a relatively straightforward manner (once understood). Its APIs are based on futures.  Seastar utilizes the following concepts to achieve extreme performance:
+seastar是个事件驱动框架。  
 
 * **Cooperative micro-task scheduler**: instead of running threads, each core runs a cooperative task scheduler. Each task is typically very lightweight -- only running for as long as it takes to process the last I/O operation's result and to submit a new one.
+每个核心运行一个写作任务调度器而不是运行线程，每个任务通常是非常轻量级的，处理最后一个IO操作和提交一个新结果
 * **Share-nothing SMP architecture**: each core runs independently of other cores in an SMP system. Memory, data structures, and CPU time are not shared; instead, inter-core communication uses explicit message passing. A Seastar core is often termed a shard. TODO: more here https://github.com/scylladb/seastar/wiki/SMP
+每个核心独立于SMP系统中其他核心运行。内存、数据结构和CPU时间不共享；内核间使用显式消息传递。  
 * **Future based APIs**: futures allow you to submit an I/O operation and to chain tasks to be executed on completion of the I/O operation. It is easy to run multiple I/O operations in parallel - for example, in response to a request coming from a TCP connection, you can issue multiple disk I/O requests, send messages to other cores on the same system, or send requests to other nodes in the cluster, wait for some or all of the results to complete, aggregate the results, and send a response.
+基于future（可参考STL中future）的API  
 * **Share-nothing TCP stack**: while Seastar can use the host operating system's TCP stack, it also provides its own high-performance TCP/IP stack built on top of the task scheduler and the share-nothing architecture. The stack provides zero-copy in both directions: you can process data directly from the TCP stack's buffers, and send the contents of your own data structures as part of a message without incurring a copy. Read more...
+无共享的TCO栈，提供自己的高性能TAP/IP栈，构建在任务调度器和无共享架构之上。提供零拷贝：可以直接从TCP堆栈的缓冲区处理数据。  
 * **DMA-based storage APIs**: as with the networking stack, Seastar provides zero-copy storage APIs, allowing you to DMA your data to and from your storage devices.
+DMA  
 
 This tutorial is intended for developers already familiar with the C++ language, and will cover how to use Seastar to create a new application.
 
@@ -77,8 +99,10 @@ int main(int argc, char** argv) {
 ```
 
 As we do in this example, each Seastar program must define and run, an `app_template` object. This object starts the main event loop (the Seastar *engine*) on one or more CPUs, and then runs the given function - in this case an unnamed function, a *lambda* - once.
+每个seastar程序需要定义app_template对象，这个对象在一个或多个核心上运行提供的函数  
 
 The `return make_ready_future<>();` causes the event loop, and the whole application, to exit immediately after printing the "Hello World" message. In a more typical Seastar application, we will want event loop to remain alive and process incoming packets (for example), until explicitly exited. Such applications will return a _future_ which determines when to exit the application. We will introduce futures and how to use them below. In any case, the regular C `exit()` should not be used, because it prevents Seastar or the application from cleaning up appropriately.
+seastar的显式退出，不使用C的exit()  
 
 As shown in this example, all Seastar functions and types live in the "`seastar`" namespace. An user can either type this namespace prefix every time, or use shortcuts like "`using seastar::app_template`" or even "`using namespace seastar`" to avoid typing this prefix. We generally recommend to use the namespace prefixes `seastar` and `std` explicitly, and will will follow this style in all the examples below.
 
@@ -130,6 +154,7 @@ $
 # Threads and memory
 ## Seastar threads
 As explained in the introduction, Seastar-based programs run a single thread on each CPU. Each of these threads runs its own event loop, known as the *engine* in Seastar nomenclature. By default, the Seastar application will take over all the available cores, starting one thread per core. We can see this with the following program, printing `seastar::smp::count` which is the number of started threads:
+基于seastar的程序在每个CPU上运行一个线程，每个线程都运行自己的事件循环，在seastar中称为引擎。默认情况下，seastar应用程序将接管所有可用的内核，每个内核启动一个线程，使用seastar::smp::count可知启动线程数量。  
 
 ```cpp
 #include <seastar/core/app-template.hh>
@@ -170,6 +195,7 @@ abort (core dumped)
 ```
 
 The error is an exception thrown from app.run, which we did not catch, leading to this ugly uncaught-exception crash. It is better to catch this sort of startup exceptions, and exit gracefully without a core dump:
+捕获异常，优雅退出。  
 
 ```cpp
 #include <seastar/core/app-template.hh>
@@ -201,6 +227,7 @@ Note that catching the exceptions this way does **not** catch exceptions thrown 
 
 ## Seastar memory
 As explained in the introduction, Seastar applications shard their memory. Each thread is preallocated with a large piece of memory (on the same NUMA node it is running on), and uses only that memory for its allocations (such as `malloc()` or `new`).
+seastar对每个线程预先分配一大块内存（在它运行的NUMA节点上），并且将这些内存用于分配，使用malloc和new。（这块需要研究一下）  
 
 By default, the machine's **entire memory** except a certain reservation left for the OS (defaulting to the maximum of 1.5G or 7% of total memory) is pre-allocated for the application in this manner. This default can be changed by *either* changing the amount reserved for the OS (not used by Seastar) with the `--reserve-memory` option, or by explicitly giving the amount of memory given to the Seastar application, with the `-m` option. This amount of memory can be in bytes, or using the units "k", "M", "G" or "T". These units use the power-of-two values: "M" is a **mebibyte**, 2^20 (=1,048,576) bytes, not a **megabyte** (10^6 or 1,000,000 bytes).
 
@@ -212,6 +239,7 @@ Couldn't start application: std::runtime_error (insufficient physical memory)
 
 # Introducing futures and continuations
 Futures and continuations, which we will introduce now, are the building blocks of asynchronous programming in Seastar. Their strength lies in the ease of composing them together into a large, complex, asynchronous program, while keeping the code fairly readable and understandable. 
+介绍futures和continuations  
 
 A [future](\ref future) is a result of a computation that may not be available yet.
 Examples include:
@@ -223,18 +251,23 @@ Examples include:
     one or more other futures.
 
 The type `future<int>` variable holds an int that will eventually be available - at this point might already be available, or might not be available yet. The method available() tests if a value is already available, and the method get() gets the value. The type `future<>` indicates something which will eventually complete, but not return any value.
+available()方法——值是否已可用，get()方法——获取值  
 
 A future is usually returned by an **asynchronous function**, a function which returns a future and arranges for this future to be eventually resolved.  Because asynchrnous functions _promise_ to eventually resolve the future which they returned, asynchronous functions are sometimes called "promises"; But we will avoid this term because it tends to confuse more than it explains.
+异步函数有时被称为promise（参见STL promise）  
 
 One simple example of an asynchronous function is Seastar's function sleep():
+一个简单异步函数——sleep()  
 
 ```cpp
 future<> sleep(std::chrono::duration<Rep, Period> dur);
 ```
 
 This function arranges a timer so that the returned future becomes available (without an associated value) when the given time duration elapses.
+计时器，过期后返回  
 
 A **continuation** is a callback (typically a lambda) to run when a future becomes available. A continuation is attached to a future with the `then()` method. Here is a simple example:
+continuation是个回调（通常是个lambda函数），在future可用时，使用then()方法与future关联起来  
 
 ```cpp
 #include <seastar/core/app-template.hh>
@@ -256,6 +289,7 @@ int main(int argc, char** argv) {
 In this example we see us getting a future from `seastar::sleep(1s)`, and attaching to it a continuation which prints a "Done." message. The future will become available after 1 second has passed, at which point the continuation is executed. Running this program, we indeed see the message "Sleeping..." immediately, and one second later the message "Done." appears and the program exits.
 
 The return value of `then()` is itself a future which is useful for chaining multiple continuations one after another, as we will explain below. But here we just note that we `return` this future from `app.run`'s function, so that the program will exit only after both the sleep and its continuation are done.
+then()返回值本身是一个future，对于一个接一个链接continuation非常有用  
 
 To avoid repeating the boilerplate "app_engine" part in every code example in this tutorial, let's create a simple main() with which we will compile the following examples. This main just calls function `future<> f()`, does the appropriate exception handling, and exits when the future returned by `f` is resolved:
 
@@ -311,6 +345,7 @@ seastar::future<> f() {
 ```
 
 Each `sleep()` and `then()` call returns immediately: `sleep()` just starts the requested timer, and `then()` sets up the function to call when the timer expires. So all three lines happen immediately and f returns. Only then, the event loop starts to wait for the three outstanding futures to become ready, and when each one becomes ready, the continuation attached to it is run. The output of the above program is of course:
+输出注意看顺序  
 ```none
 $ ./a.out
 Sleeping... 100ms 200ms Done.
@@ -335,15 +370,20 @@ seastar::future<> f() {
 ```
 
 The function `slow()` deserves more explanation. As usual, this function returns a future<int> immediately, and doesn't wait for the sleep to complete, and the code in `f()` can chain a continuation to this future's completion. The future returned by `slow()` is itself a chain of futures: It will become ready once sleep's future becomes ready and then the value 3 is returned. We'll explain below in more details how `then()` returns a future, and how this allows *chaining* futures.
+slow()函数立即返回一个future，而不会等待sleep()，future准备好，来一手f()return  
 
 This example begins to show the convenience of the futures programming model, which allows the programmer to neatly encapsulate complex asynchronous operations. slow() might involve a complex asynchronous operation requiring multiple steps, but its user can use it just as easily as a simple sleep(), and Seastar's engine takes care of running the continuations whose futures have become ready at the right time.
+这个例子展示了future编程模型的便利性，允许程序员巧妙地封装复杂的异步操作。seastar引擎负责运行哪些futureOK的continuation  
 
 ## Ready futures
 A future value might already be ready when `then()` is called to chain a continuation to it. This important case is optimized, and *usually* the continuation is run immediately instead of being registered to run later in the next iteration of the event loop.
+当future已经准备好了，这种情况得到优化，continuation会立即运行而不会注册到事件循环中  
 
 This optimization is done *usually*, though sometimes it is avoided: The implementation of `then()` holds a counter of such immediate continuations, and after many continuations have been run immediately without returning to the event loop (currently the limit is 256), the next continuation is deferred to the event loop in any case. This is important because in some cases (such as future loops, discussed later) we could find that each ready continuation spawns a new one, and without this limit we can starve the event loop. It important not to starve the event loop, as this would starve continuations of futures that weren't ready but have since become ready, and also starve the important **polling** done by the event loop (e.g., checking whether there is new activity on the network card).
+注意是“usually”，不是一定  
 
 `make_ready_future<>` can be used to return a future which is already ready. The following example is identical to the previous one, except the promise function `fast()` returns a future which is already ready, and not one which will be ready in a second as in the previous example. The nice thing is that the consumer of the future does not care, and uses the future in the same way in both cases.
+make_ready_future<>返回一个已经准备好的future  
 
 ```cpp
 #include <seastar/core/future.hh>
@@ -382,12 +422,16 @@ seastar::future<> f() {
 ```
 
 The future operation `incr(i)` takes some time to complete (it needs to sleep a bit first...), and in that duration, it needs to save the `i` value it is working on. In the early event-driven programming models, the programmer needed to explicitly define an object for holding this state, and to manage all these objects. Everything is much simpler in Seastar, with C++11's lambdas: The *capture syntax* "`[i]`" in the above example means that the value of i, as it existed when incr() was called() is captured into the lambda. The lambda is not just a function - it is in fact an *object*, with both code and data. In essence, the compiler created for us automatically the state object, and we neither need to define it, nor to keep track of it (it gets saved together with the continuation, when the continuation is deferred, and gets deleted automatically after the continuation runs).
+lambda函数的捕获列表  
 
 One implementation detail worth understanding is that when a continuation has captured state and is run immediately, this capture incurs no runtime overhead. However, when the continuation cannot be run immediately (because the future is not yet ready) and needs to be saved till later, memory needs to be allocated on the heap for this data, and the continuation's captured data needs to be copied there. This has runtime overhead, but it is unavoidable, and is very small compared to the related overhead in the threaded programming model (in a threaded program, this sort of state usually resides on the stack of the blocked thread, but the stack is much larger than our tiny capture state, takes up a lot of memory and causes a lot of cache pollution on context switches between those threads).
+为捕获的数据在堆上分配内存，当然开销远小于线程啥的  
 
 In the above example, we captured `i` *by value* - i.e., a copy of the value of `i` was saved into the continuation. C++ has two additional capture options: capturing by *reference* and capturing by *move*:
+C++特性引用捕获和移动捕获
 
 Using capture-by-reference in a continuation is usually a mistake, and can lead to serious bugs. For example, if in the above example we captured a reference to i, instead of copying it,
+在continuation中使用引用捕获可能会导致错误  
 ```cpp
 seastar::future<int> incr(int i) {
     using namespace std::chrono_literals;
@@ -396,10 +440,13 @@ seastar::future<int> incr(int i) {
 }
 ```
 this would have meant that the continuation would contain the address of `i`, not its value. But `i` is a stack variable, and the incr() function returns immediately, so when the continuation eventually gets to run, long after incr() returns, this address will contain unrelated content.
+continuation包含i的地址而非其值，i是个栈变量，incr()函数会立即返回，continuation运行时，incr()早就凉了，地址中的玩意就和咱不相关了  
 
 An exception to the capture-by-reference-is-usually-a-mistake rule is the `do_with()` idiom, which we will introduce later. This idiom ensures that an object lives throughout the life of the continuation, and makes capture-by-reference possible, and very convenient.
+引用捕获通常是错误的，也有例外，do_with()确保对象在延续的整个生命周期都存在，并使引用捕获称为可能，而且非常方便。  
 
 Using capture-by-*move* in continuations is also very useful in Seastar applications. By **moving** an object into a continuation, we transfer ownership of this object to the continuation, and make it easy for the object to be automatically deleted when the continuation ends. For example, consider a traditional function taking a std::unique_ptr<T>.
+对于移动语义的捕获，可考虑用unique_ptr保护  
 ```cpp
 int do_something(std::unique_ptr<T> obj) {
      // do some computation based on the contents of obj, let's say the result is 17
@@ -417,6 +464,7 @@ seastar::future<int> slow_do_something(std::unique_ptr<T> obj) {
 ```
 
 The problem is that a unique_ptr cannot be passed into a continuation by value, as this would require copying it, which is forbidden because it violates the guarantee that only one copy of this pointer exists. We can, however, *move* obj into the continuation:
+unique_ptr不能通过值传递给continuation，因为需要复制它，这是禁止的。  
 ```cpp
 seastar::future<int> slow_do_something(std::unique_ptr<T> obj) {
     using namespace std::chrono_literals;
@@ -428,8 +476,10 @@ seastar::future<int> slow_do_something(std::unique_ptr<T> obj) {
 Here the use of `std::move()` causes obj's move-assignment is used to move the object from the outer function into the continuation. The notion of move (*move semantics*), introduced in C++11, is similar to a shallow copy followed by invalidating the source copy (so that the two copies do not co-exist, as forbidden by unique_ptr). After moving obj into the continuation, the top-level function can no longer use it (in this case it's of course ok, because we return anyway).
 
 The `[obj = ...]` capture syntax we used here is new to C++14. This is the main reason why Seastar requires C++14, and does not support older C++11 compilers.
+C++14支持[obj = ...]，而C++11则不支持
 
 The extra `() mutable` syntax was needed here because by default when C++ captures a value (in this case, the value of std::move(obj)) into a lambda, it makes this value read-only, so our lambda cannot, in this example, move it again. Adding `mutable` removes this artificial restriction.
+mutable——可修改  
 
 ## Chaining continuations
 TODO: We already saw chaining example in slow() above. talk about the return from then, and returning a future and chaining more thens.
@@ -501,6 +551,7 @@ seastar::future<> fail() {
 Here, `fail()` does not return a failing future. Rather, it fails to return a future at all! The exception it throws stops the entire function `f()`, and the `finally()` continuation does not not get attached to the future (which was never returned), and will never run. The "cleaning up" message is not printed now.
 
 We recommend that to reduce the chance for such errors, asynchronous functions should always return a failed future rather than throw an actual exception. If the asynchronous function calls another function _before_ returning a future, and that second function might throw, it should use `try`/`catch` to catch the exception and convert it into a failed future:
+我们建议返回一个失败的future而不是抛出一个实际的异常  
 
 ```cpp
 void inner() {
@@ -520,6 +571,7 @@ Here, `fail()` catches the exception thrown by `inner()`, whatever it might be, 
 
 >Despite this recommendation that asynchronous functions avoid throwing, some asynchronous functions do throw exceptions in addition to returning exceptional futures. A common example are functions which allocate memory and throw `std::bad_alloc` when running out of memory, instead of returning a future. The `future<> seastar::semaphore::wait()` method is one such function: It returns a future which may be exceptional if the semaphore was `broken()` or the wait timed out, but may also *throw* an exception when failing to allocate memory it needs to hold the list of waiters.
 > Therefore, unless a function --- including asynchronous functions --- is explicitly tagged "`noexcept`", the application should be prepared to handle exceptions thrown from it. In modern C++, code usually uses RAII to be exception-safe without sprinkling it with `try`/`catch`.  `seastar::defer()` is a RAII-based idiom that ensures that some cleanup code is run even if an exception is thrown.
+seastar::defer()是一个RAII用法，确保即使抛出异常，也会运行一些清理代码。  
 
 
 Seastar has a convenient generic function, `futurize_invoke()`, which can be useful here. `futurize_invoke(func, args...)` runs a function which may return either a future value or an immediate value, and in both cases convert the result into a future value. `futurize_invoke()` also converts an immediate exception thrown by the function, if any, into a failed future, just like we did above. So using `futurize_invoke()` we can make the above example work even if `fail()` did throw exceptions:
@@ -557,6 +609,7 @@ Seastar offers a variety of mechanisms for safely and efficiently keeping object
 
 ## Passing ownership to continuation
 The most straightforward way to ensure that an object is alive when a continuation runs and is destroyed afterwards is to pass its ownership to the continuation. When continuation *owns* the object, the object will be kept until the continuation runs, and will be destroyed as soon as the continuation is not needed (i.e., it may have run, or skipped in case of exception and `then()` continuation).
+最直接的方法就是将所有权交给continuation  
 
 We already saw above that the way for a continuation to get ownership of an object is through *capturing*:
 
@@ -566,8 +619,10 @@ seastar::future<> slow_incr(int i) {
 }
 ```
 Here the continuation captures the value of `i`. In other words, the continuation includes a copy of `i`. When the continuation runs 10ms later, it will have access to this value, and as soon as the continuation finishes its object is destroyed, together with its captured copy of `i`. The continuation owns this copy of `i`.
+continuation获取i的值  
 
 Capturing by value as we did here - making a copy of the object we need in the continuation - is useful mainly for very small objects such as the integer in the previous example. Other objects are expensive to copy, or sometimes even cannot be copied. For example, the following is **not** a good idea:
+值捕获对非常小的对象是OK的，但对复制成本很高的对象（有些无法复制），这不是个好主意  
 ```cpp
 seastar::future<> slow_op(std::vector<int> v) {
     // this makes another copy of v:
@@ -575,8 +630,10 @@ seastar::future<> slow_op(std::vector<int> v) {
 }
 ```
 This would be inefficient - as the vector `v`, potentially very long, will be copied and the copy will be saved in the continuation. In this example, there is no reason to copy `v` - it was anyway passed to the function by value and will not be used again after capturing it into the continuation, as right after the capture, the function returns and destroys its copy of `v`.
+如果vector的元素很大，复制消耗很大
 
 For such cases, C++14 allows *moving* the object into the continuation:
+C++14允许移动语义用在continuation  
 ```cpp
 seastar::future<> slow_op(std::vector<int> v) {
     // v is not copied again, but instead moved:
@@ -588,6 +645,7 @@ Now, instead of copying the object `v` into the continuation, it is *moved* into
 TODO: talk about temporary_buffer as an example of an object designed to be moved in this way.
 
 In some cases, moving the object is undesirable. For example, some code keeps references to an object or one of its fields and the references become invalid if the object is moved. In some complex objects, even the move constructor is slow. For these cases, C++ provides the useful wrapper `std::unique_ptr<T>`. A `unique_ptr<T>` object owns an object of type `T` allocated on the heap. When a `unique_ptr<T>` is moved, the object of type T is not touched at all - just the pointer to it is moved. An example of using `std::unique_ptr<T>` in capture is:
+在某些情况移动对象不可取，使用std::unique_ptr解决  
 
 ```cpp
 seastar::future<> slow_op(std::unique_ptr<T> p) {
@@ -629,12 +687,16 @@ seastar::future<> slow_op(T& o) {           // <-- pass by reference
 ```
 
 This approach raises a question: The caller of `slow_op` is now responsible for keeping the object `o` alive while the asynchronous code started by `slow_op` needs this object. But how will this caller know how long this object is actually needed by the asynchronous operation it started?
+这里有个问题，这个对象到底需要维持多长时间  
 
 The most reasonable answer is that an asynchronous function may need access to its parameters until the future it returns is resolved - at which point the asynchronous code completes and no longer needs access to its parameters. We therefore recommend that Seastar code adopt the following convention:
+最合理的答案是，异步函数可能需要访问它的参数，直到他返回的future被解析——此时异步代码完成，不再需要访问它的参数。  
 
 > **Whenever an asynchronous function takes a parameter by reference, the caller must ensure that the referred object lives until the future returned by the function is resolved.**
+每当一个异步函数通过引用获取一个参数时，调用者必须确保被引用对象一直存在，直到该函数返回的未来被解析为止。  
 
 Note that this is merely a convention suggested by Seastar, and unfortunately nothing in the C++ language enforces it. C++ programmers in non-Seastar programs often pass large objects to functions as a const reference just to avoid a slow copy, and assume that the called function will *not* save this reference anywhere. But in Seastar code, that is a dangerous practice because even if the asynchronous function did not intend to save the reference anywhere, it may end up doing it implicitly by passing this reference to another function and eventually capturing it in a continuation.
+这只是seastar建议的约定，C++并没有强制执行  
 
 > It would be nice if future versions of C++ could help us catch incorrect uses of references. Perhaps we could have a tag for a special kind of reference, an "immediate reference" which a function can use use immediately (i.e, before returning a future), but cannot be captured into a continuation.
 
